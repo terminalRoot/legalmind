@@ -21,13 +21,15 @@ We welcome any and all contributions! Here are some ways you can get started:
 4. Set the enviornment for huggingface in fine-tune.py file.
 5. Keep the dataset in data folder as data.csv with single column header as text.
 6. Run the file with specific configuration:
-    ```python llama2-finetune.py --model_name meta-llama/Llama-2-7b-hf \
+    ```
+    python llama2-finetune.py --model_name meta-llama/Llama-2-7b-hf \
      --load_in_4bit \
      --use_peft \
      --batch_size 4 \
      --gradient_accumulation_steps 2 \
      --num_train_epochs 5 \
-     --output_dir output-paragraph```
+     --output_dir output-paragraph
+     ```
 7. We are using Intel Accelerated APIs to further run the inference model on CPU only hardware.
 8. Run the inference after training completes:
     ```python inference.py```
