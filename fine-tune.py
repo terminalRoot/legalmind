@@ -1,186 +1,363 @@
+import logging
 import os
-os.environ['TRANSFORMERS_CACHE'] = './huggingface'
-os.environ['HUGGING_FACE_HUB_TOKEN'] = ''
+import sys
+from math import ceil
+from typing import Optional, Tuple
+import warnings
 
-from dataclasses import dataclass, field
-from typing import Optional
-import pandas as pd
-from datasets import Dataset
+warnings.filterwarnings(
+    "ignore", category=UserWarning, module="intel_extension_for_pytorch"
+)
+warnings.filterwarnings(
+    "ignore", category=UserWarning, module="torchvision.io.image", lineno=13
+)
+warnings.filterwarnings("ignore", message="You are using the default legacy behaviour")
+warnings.filterwarnings("ignore", category=UserWarning, message=".*Parameter.*")
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message="This implementation of AdamW is deprecated",
+)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["NUMEXPR_MAX_THREADS"] = "28"
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("bigdl").setLevel(logging.ERROR)
+
+
 import torch
-from torch import nn
-from accelerate import Accelerator
+import intel_extension_for_pytorch as ipex
 from datasets import load_dataset
+from datasets import Dataset
+from bigdl.llm.transformers import AutoModelForCausalLM
+from bigdl.llm.transformers.qlora import (
+    get_peft_model,
+    prepare_model_for_kbit_training as prepare_model,
+)
 from peft import LoraConfig
-from tqdm import tqdm
-from transformers import AutoModelForCausalLM, BitsAndBytesConfig, HfArgumentParser, TrainingArguments
+from bigdl.llm.transformers.qlora import PeftModel
+import transformers
+from transformers import (
+    DataCollatorForSeq2Seq,
+    LlamaTokenizer,
+    AutoTokenizer,
+    Trainer,
+    TrainingArguments,
+)
 
-from trl import SFTTrainer, is_xpu_available
+transformers.logging.set_verbosity_error()
 
 
-tqdm.pandas()
+import os
+import shutil
+
+BASE_MODELS = {
+    "1": "NousResearch/Llama-2-7b-chat-hf",  # https://huggingface.co/NousResearch/Llama-2-7b-chat-hf
+}
+
+BASE_MODEL = BASE_MODELS["1"]
+DATA_PATH = "data"
+MODEL_PATH = "./final_model"
+ADAPTER_PATH = "./lora_adapters"
+DEVICE = torch.device("xpu" if torch.xpu.is_available() else "cpu")
+LORA_CONFIG = LoraConfig(
+    r=16,  # rank
+    lora_alpha=32,  # scaling factor
+    target_modules=["q_proj", "k_proj", "v_proj"], 
+    lora_dropout=0.05,
+    bias="none",
+    task_type="CAUSAL_LM",
+)
+
+MODEL_CACHE_PATH = "./llm_models"
+
+print("=" * 80)
+print(f"Using Device: {DEVICE}")
+print(f"Final model will be saved to: {MODEL_PATH}")
+print(f"LoRA adapters will be saved to: {ADAPTER_PATH}")
+print(f"Finetuning Model: {BASE_MODEL}")
+print(f"Using dataset from: {DATA_PATH}")
+print(f"Model cache: {MODEL_CACHE_PATH}")
+print("=" * 80)
 
 
-# Define and parse arguments.
-@dataclass
-class ScriptArguments:
+
+def generate_prompt_sql(input_text):
     """
-    The name of the Casual LM model we wish to fine with SFTTrainer
+    Generates a prompt for fine-tuning the LLM model for legal domain tasks.
+
+    Parameters:
+        input_text (str): The input text or question answer.
+
+    Returns:
+        str: A formatted string serving as the prompt for the fine-tuning task.
     """
+    return f"""You are a helpful legal solution model. Your job is to answer questions about a legal task.
+{input_text}"""
 
-    model_name: Optional[str] = field(default="meta-llama/Llama-2-7b-hf", metadata={"help": "the model name"})
-    dataset_name: Optional[str] = field(
-        default="timdettmers/openassistant-guanaco", metadata={"help": "the dataset name"}
-    )
-    dataset_text_field: Optional[str] = field(default="text", metadata={"help": "the text field of the dataset"})
-    log_with: Optional[str] = field(default="none", metadata={"help": "use 'wandb' to log with wandb"})
-    learning_rate: Optional[float] = field(default=1.41e-5, metadata={"help": "the learning rate"})
-    batch_size: Optional[int] = field(default=64, metadata={"help": "the batch size"})
-    seq_length: Optional[int] = field(default=512, metadata={"help": "Input sequence length"})
-    gradient_accumulation_steps: Optional[int] = field(
-        default=16, metadata={"help": "the number of gradient accumulation steps"}
-    )
-    load_in_8bit: Optional[bool] = field(default=False, metadata={"help": "load the model in 8 bits precision"})
-    load_in_4bit: Optional[bool] = field(default=True, metadata={"help": "load the model in 4 bits precision"})
-    use_peft: Optional[bool] = field(default=True, metadata={"help": "Wether to use PEFT or not to train adapters"})
-    trust_remote_code: Optional[bool] = field(default=False, metadata={"help": "Enable `trust_remote_code`"})
-    output_dir: Optional[str] = field(default="output", metadata={"help": "the output directory"})
-    peft_lora_r: Optional[int] = field(default=64, metadata={"help": "the r parameter of the LoRA adapters"})
-    peft_lora_alpha: Optional[int] = field(default=16, metadata={"help": "the alpha parameter of the LoRA adapters"})
-    logging_steps: Optional[int] = field(default=1, metadata={"help": "the number of logging steps"})
-    use_auth_token: Optional[bool] = field(default=True, metadata={"help": "Use HF auth token to access the model"})
-    num_train_epochs: Optional[int] = field(default=3, metadata={"help": "the number of training epochs"})
-    max_steps: Optional[int] = field(default=-1, metadata={"help": "the number of training steps"})
-    save_steps: Optional[int] = field(
-        default=100, metadata={"help": "Number of updates steps before two checkpoint saves"}
-    )
-    save_total_limit: Optional[int] = field(default=10, metadata={"help": "Limits total number of checkpoints."})
-    push_to_hub: Optional[bool] = field(default=False, metadata={"help": "Push the model to HF Hub"})
-    gradient_checkpointing: Optional[bool] = field(
-        default=False, metadata={"help": "Whether to use gradient checkpointing or no"}
-    )
-    gradient_checkpointing_kwargs: Optional[dict] = field(
-        default=None,
-        metadata={
-            "help": "key word arguments to be passed along `torch.utils.checkpoint.checkpoint` method - e.g. `use_reentrant=False`"
-        },
-    )
-    hub_model_id: Optional[str] = field(default=None, metadata={"help": "The name of the model on HF Hub"})
+def setup_model_and_tokenizer(base_model_id: str):
+    """Downloads / Loads the pre-trained model in NF4 datatype and tokenizer based on the given base model ID for training."""
+    local_model_id = base_model_id.replace("/", "--")
+    local_model_path = os.path.join(MODEL_CACHE_PATH, local_model_id)
+    print(f"local model path is: {local_model_path}")
 
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            local_model_path,
+            load_in_low_bit="nf4",
+            optimize_model=False,
+            torch_dtype=torch.float16,
+            modules_to_not_convert=["lm_head"],
+        )
+    except OSError as e:
+        print(e)
+        sys.exit()
+        logging.info(
+            f"Model not found locally. Downloading {base_model_id} to cache..."
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            base_model_id,
+            load_in_low_bit="nf4",
+            optimize_model=False,
+            torch_dtype=torch.float16,
+            modules_to_not_convert=["lm_head"],
+        )
 
-parser = HfArgumentParser(ScriptArguments)
-script_args = parser.parse_args_into_dataclasses()[0]
+    try:
+        if "llama" in base_model_id.lower():
+            tokenizer = LlamaTokenizer.from_pretrained(local_model_path)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(local_model_path)
+    except OSError:
+        logging.info(
+            f"Tokenizer not found locally. Downloading tokenizer for {base_model_id} to cache..."
+        )
+        if "llama" in base_model_id.lower():
+            tokenizer = LlamaTokenizer.from_pretrained(base_model_id)
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(base_model_id)
+    tokenizer.pad_token_id = 0
+    tokenizer.padding_side = "left"
+    return model, tokenizer
 
-# Step 1: Load the model
-if script_args.load_in_8bit and script_args.load_in_4bit:
-    raise ValueError("You can't load the model in 8 bits and 4 bits at the same time")
-elif script_args.load_in_8bit or script_args.load_in_4bit:
-    quantization_config = BitsAndBytesConfig(
-        load_in_8bit=script_args.load_in_8bit, load_in_4bit=script_args.load_in_4bit
-    )
-    # Copy the model to each device
-    device_map = (
-        {"": f"xpu:{Accelerator().local_process_index}"}
-        if is_xpu_available()
-        else {"": Accelerator().local_process_index}
-    )
-    torch_dtype = torch.bfloat16
-else:
-    device_map = None
-    quantization_config = None
-    torch_dtype = None
+class FineTuner:
+    """A class to handle the fine-tuning of LLM models."""
 
-device_map="auto"
+    def __init__(self, base_model_id: str, model_path: str, device: torch.device):
+        """
+        Initialize the FineTuner with base model, model path, and device.
 
-model = AutoModelForCausalLM.from_pretrained(
-    script_args.model_name,
-    quantization_config=quantization_config,
-    device_map=device_map,
-    trust_remote_code=script_args.trust_remote_code,
-    torch_dtype=torch_dtype,
-    use_auth_token=script_args.use_auth_token,
-)
-
-# Step 2: Load the dataset
-def read_dataframe(file_path):
-    df = pd.read_csv(file_path)
-    df = df.rename(columns={"Prompt":"Human", "Output": "Assistant"})
-    df = df[["Human", "Assistant"]]
-    df['Human'] = "### Human: "+ df['Human'].astype(str)
-    df['Assistant'] = "### Assistant: "+ df['Assistant'].astype(str) + "### Human: Now explain it to a dog"
-    series = df.apply(lambda row: row['Human'] + row['Assistant'], axis=1)
-    series = series.reset_index(drop=True)
-    data = series.tolist()
-    return Dataset.from_dict({"text": data})
-
-def prepare_series(file_path):
-    series = pd.read_csv(file_path)
-    series.columns = ['text']
-    series = series['text']
-    data = series.tolist()
-    return Dataset.from_dict({"text": data})
-
-# dataset = prepare_series("data/text.csv")
-# dataset = prepare_series("data/qa.csv")
-dataset = prepare_series("data/data.csv")
-dataset = dataset.with_format("torch")
-
-# Step 3: Define the training arguments
-training_args = TrainingArguments(
-    output_dir=script_args.output_dir,
-    per_device_train_batch_size=script_args.batch_size,
-    gradient_accumulation_steps=script_args.gradient_accumulation_steps,
-    learning_rate=script_args.learning_rate,
-    logging_steps=script_args.logging_steps,
-    num_train_epochs=script_args.num_train_epochs,
-    max_steps=script_args.max_steps,
-    report_to=script_args.log_with,
-    save_steps=script_args.save_steps,
-    save_total_limit=script_args.save_total_limit,
-    push_to_hub=script_args.push_to_hub,
-    hub_model_id=script_args.hub_model_id,
-    gradient_checkpointing=script_args.gradient_checkpointing,
-    # TODO: uncomment that on the next release
-    # gradient_checkpointing_kwargs=script_args.gradient_checkpointing_kwargs,
-)
-
-# Step 4: Define the LoraConfig
-if script_args.use_peft:
-    peft_config = LoraConfig(
-        r=script_args.peft_lora_r,
-        lora_alpha=script_args.peft_lora_alpha,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=["q_proj", "k_proj", "v_proj"],
-        # target_modules=["q", "k", "v", "o"], #TODO:
-    )
-else:
-    peft_config = None
-
-# Step 5: Define the Trainer
-trainer = SFTTrainer(
-    model=model,
-    args=training_args,
-    max_seq_length=script_args.seq_length,
-    train_dataset=dataset,
-    dataset_text_field=script_args.dataset_text_field,
-    peft_config=peft_config,
-)
-
-trainer.train()
-
-# Step 6: Save the model
-trainer.save_model(script_args.output_dir)
+        Parameters:
+            base_model_id (str): Id of pre-trained model to use for fine-tuning.
+            model_path (str): Path to save the fine-tuned model.
+            device (torch.device): Device to run the model on.
+        """
+        self.base_model_id = base_model_id
+        self.model_path = model_path
+        self.device = device
+        self.model, self.tokenizer = setup_model_and_tokenizer(base_model_id)
 
 
+    def tokenize_data(
+        self, data_points, add_eos_token=True, train_on_inputs=False, cutoff_len=512
+    ) -> dict:
+        """
+        Tokenizes dataset of SQL related data points consisting of questions, context, and answers.
 
-# python llama2-finetune.py --model_name meta-llama/Llama-2-7b-hf \
-    # --load_in_4bit \
-    # --use_peft \
-    # --batch_size 4 \
-    # --gradient_accumulation_steps 2 \
-    # --num_train_epochs 5 \
-    # --output_dir output-paragraph
+        Parameters:
+            data_points (dict): A batch from the dataset containing 'question', 'context', and 'answer'.
+            add_eos_token (bool): Whether to add an EOS token at the end of each tokenized sequence.
+            cutoff_len (int): The maximum length for each tokenized sequence.
 
-# python fine-tune.py --load_in_4bit --use_peft --batch_size 4 --gradient_accumulation_steps 2 --num_train_epochs 10 --output_dir output-paragraph
-# python llama2-finetune.py --model_name ouptut-paragraph --load_in_4bit --use_peft --batch_size 4 --gradient_accumulation_steps 2 --num_train_epochs 5 --output_dir ouptut-legal
+        Returns:
+            dict: A dictionary containing tokenized 'input_ids', 'attention_mask', and 'labels'.
+        """
+        try:
+            question = data_points["question"]
+            context = data_points["context"]
+            answer = data_points["answer"]
+            if train_on_inputs:
+                user_prompt = generate_prompt_sql(question, context)
+                tokenized_user_prompt = self.tokenizer(
+                    user_prompt,
+                    truncation=True,
+                    max_length=cutoff_len,
+                    padding=False,
+                    return_tensors=None,
+                )
+                user_prompt_len = len(tokenized_user_prompt["input_ids"])
+                if add_eos_token:
+                    user_prompt_len -= 1
 
+            combined_text = generate_prompt_sql(question, context, answer)
+            tokenized = self.tokenizer(
+                combined_text,
+                truncation=True,
+                max_length=cutoff_len,
+                padding=False,
+                return_tensors=None,
+            )
+            if (
+                tokenized["input_ids"][-1] != self.tokenizer.eos_token_id
+                and add_eos_token
+                and len(tokenized["input_ids"]) < cutoff_len
+            ):
+                tokenized["input_ids"].append(self.tokenizer.eos_token_id)
+                tokenized["attention_mask"].append(1)
+            tokenized["labels"] = tokenized["input_ids"].copy()
+            if train_on_inputs:
+                tokenized["labels"] = [-100] * user_prompt_len + tokenized["labels"][
+                    user_prompt_len:
+                ]
+
+            return tokenized
+        except Exception as e:
+            logging.error(
+                f"Error in batch tokenization: {e}, Line: {e.__traceback__.tb_lineno}"
+            )
+            raise e
+
+    def prepare_data(self, data, val_set_size=100) -> Dataset:
+        """Prepare training and validation datasets."""
+        try:
+            train_val_split = data["train"].train_test_split(
+                test_size=val_set_size, shuffle=True, seed=42
+            )
+            train_data = train_val_split["train"].shuffle().map(self.tokenize_data)
+            val_data = train_val_split["test"].shuffle().map(self.tokenize_data)
+            return train_data, val_data
+        except Exception as e:
+            logging.error(
+                f"Error in preparing data: {e}, Line: {e.__traceback__.tb_lineno}"
+            )
+            raise e
+
+    def train_model(self, train_data, val_data, training_args):
+        """
+        Fine-tune the model with the given training and validation data.
+
+        Parameters:
+            train_data (Dataset): Training data.
+            val_data (Optional[Dataset]): Validation data.
+            training_args (TrainingArguments): Training configuration.
+        """
+        try:
+            self.model = self.model.to(self.device)
+            self.model = prepare_model(self.model)
+            self.model = get_peft_model(self.model, LORA_CONFIG)
+            trainer = Trainer(
+                model=self.model,
+                train_dataset=train_data,
+                eval_dataset=val_data,
+                args=training_args,
+                data_collator=DataCollatorForSeq2Seq(
+                    self.tokenizer,
+                    pad_to_multiple_of=8,
+                    return_tensors="pt",
+                    padding=True,
+                ),
+            )
+            self.model.config.use_cache = False
+            trainer.train()
+            self.model.save_pretrained(self.model_path)
+        except Exception as e:
+            logging.error(f"Error in model training: {e}")
+
+    def finetune(self, data_path, training_args):
+        """
+        Execute the fine-tuning pipeline.
+
+        Parameters:
+            data_path (str): Path to the data for fine-tuning.
+            training_args (TrainingArguments): Training configuration.
+        """
+        try:
+            data = load_dataset(data_path)
+            train_data, val_data = self.prepare_data(data)
+            self.train_model(train_data, val_data, training_args)
+        except KeyboardInterrupt:
+            print("Interrupt received, saving model...")
+            self.model.save_pretrained(f"{self.model_path}_interrupted")
+            print(f"Model saved to {self.model_path}_interrupted")
+        except Exception as e:
+            logging.error(f"Error in fintuning: {e}")
+
+
+
+
+
+
+ENABLE_WANDB = False
+
+def finetune(
+    device=DEVICE,
+    model=BASE_MODEL,
+    per_device_batch_size=4,
+    warmup_steps=20,
+    learning_rate=2e-5,
+    max_steps=200,
+    gradient_accum_steps=4,
+):
+    try:
+        # Training parameters
+        save_steps = 5
+        eval_steps = 5
+        max_grad_norm = 0.3
+        save_total_limit = 3
+        logging_steps = 5
+
+        print("\n" + "\033[1;34m" + "=" * 60 + "\033[0m")
+        print("\033[1;34mTraining Parameters:\033[0m")
+        param_format = "\033[1;34m{:<25} {}\033[0m"
+        print(param_format.format("Foundation model:", BASE_MODEL))
+        print(param_format.format("Model save path:", MODEL_PATH))
+        print(param_format.format("Device used:", DEVICE))
+        if DEVICE.type.startswith("xpu"):
+            print(param_format.format("Intel GPU:", torch.xpu.get_device_name()))
+        print(param_format.format("Batch size per device:", per_device_batch_size))
+        print(param_format.format("Gradient accum. steps:", gradient_accum_steps))
+        print(param_format.format("Warmup steps:", warmup_steps))
+        print(param_format.format("Save steps:", save_steps))
+        print(param_format.format("Evaluation steps:", eval_steps))
+        print(param_format.format("Max steps:", max_steps))
+        print(param_format.format("Learning rate:", learning_rate))
+        print(param_format.format("Max gradient norm:", max_grad_norm))
+        print(param_format.format("Save total limit:", save_total_limit))
+        print(param_format.format("Logging steps:", logging_steps))
+        print("\033[1;34m" + "=" * 60 + "\033[0m\n")
+
+        # Initialize the finetuner with the model and device information
+        finetuner = FineTuner(
+            base_model_id=model, model_path=MODEL_PATH, device=device
+        )
+
+        training_args = TrainingArguments(
+            per_device_train_batch_size=per_device_batch_size,
+            gradient_accumulation_steps=gradient_accum_steps,
+            warmup_steps=warmup_steps,
+            save_steps=save_steps,
+            save_strategy="steps",
+            eval_steps=eval_steps,
+            evaluation_strategy="steps",
+            max_steps=max_steps,
+            learning_rate=learning_rate,
+            #max_grad_norm=max_grad_norm,
+            bf16=True,
+            #lr_scheduler_type="cosine",
+            load_best_model_at_end=True,
+            ddp_find_unused_parameters=False,
+            group_by_length=True,
+            save_total_limit=save_total_limit,
+            logging_steps=logging_steps,
+            optim="adamw_hf",
+            output_dir="./lora_adapters",
+            logging_dir="./logs",
+            report_to="wandb" if ENABLE_WANDB else [],
+        )
+
+        # Start fine-tuning
+        finetuner.finetune(DATA_PATH, training_args)
+    except Exception as e:
+        logging.error(f"Error occurred: {e}")
+
+
+finetune()

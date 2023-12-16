@@ -1,12 +1,13 @@
 import os
 os.environ['TRANSFORMERS_CACHE'] = './huggingface'
 os.environ['HF_HOME'] = './huggingface'
-os.environ['HUGGING_FACE_HUB_TOKEN'] = ''
+os.environ['HUGGING_FACE_HUB_TOKEN'] = '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'
 
 from langchain.vectorstores import Chroma
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM , AutoModelForCausalLM
 from transformers import pipeline, BitsAndBytesConfig
 import torch
+import intel_extension_for_pytorch as ipex
 from langchain.llms import HuggingFacePipeline
 from langchain.embeddings import SentenceTransformerEmbeddings
 from langchain.chains import RetrievalQA
@@ -25,34 +26,37 @@ def chat(chat_history, user_input):
 
 checkpoint = "meta-llama/Llama-2-7b-chat-hf"
 checkpoint = "output"
-checkpoint = "output-para"
+checkpoint = "output-paragraph"
+checkpoint = ""
 tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-# base_model = AutoModelForSeq2SeqLM.from_pretrained(
-#     checkpoint,
-#     device_map="auto",
-#     torch_dtype = torch.float32)
 
 bnb_config = BitsAndBytesConfig(
-        # load_in_4bit=True,
-        # bnb_4bit_use_double_quant=True,
-        # bnb_4bit_quant_type="nf4",
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=torch.bfloat16,#float16
     )
 
+
+device = "xpu"
 base_model = AutoModelForCausalLM.from_pretrained(
     checkpoint,
     device_map="auto",
     quantization_config=bnb_config,
     torch_dtype=torch.bfloat16,
-)
+    low_cpu_mem_usage=True,
+    trust_remote_code=True,
+).to(device)
+.eval()
 
-# input('model loaded...')
+try:
+    ipex.optimize_transformers(base_model, dtype=torch_dtype)
+except:
+    ipex.optimize(base_model, dtype=torch_dtype)
 
-# sentence-transformers/msmarco-MiniLM-L-12-v3
-# embeddings = SentenceTransformerEmbeddings(model_name="sentence-transformers/multi-qa-mpnet-base-dot-v1")
 embeddings = SentenceTransformerEmbeddings(model_name="sentence-transformers/msmarco-MiniLM-L-12-v3")
 db = Chroma(persist_directory="vector_data", embedding_function=embeddings)
-# db = Chroma(persist_directory="vector_data_empty", embedding_function=embeddings)
+
 
 pipe = pipeline(
     'text2text-generation',
@@ -75,8 +79,6 @@ qa_chain = RetrievalQA.from_chain_type(llm=local_llm,
 
 with gr.Blocks() as gradioUI:
 
-    #gr.Image('lawgptlogo.png')
-    
     with gr.Row():
         chatbot = gr.Chatbot()
     with gr.Row():
