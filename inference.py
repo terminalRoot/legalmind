@@ -1,7 +1,6 @@
 import os
 os.environ['TRANSFORMERS_CACHE'] = './huggingface'
 os.environ['HF_HOME'] = './huggingface'
-os.environ['HUGGING_FACE_HUB_TOKEN'] = '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'
 
 from langchain.vectorstores import Chroma
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM , AutoModelForCausalLM
