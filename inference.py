@@ -23,10 +23,7 @@ def chat(chat_history, user_input):
         response += letter + ""
         yield chat_history + [(user_input, response)]
 
-checkpoint = "meta-llama/Llama-2-7b-chat-hf"
-checkpoint = "output"
-checkpoint = "output-paragraph"
-checkpoint = ""
+checkpoint = "llm_models/output-paragraph"
 tokenizer = AutoTokenizer.from_pretrained(checkpoint)
 
 bnb_config = BitsAndBytesConfig(
