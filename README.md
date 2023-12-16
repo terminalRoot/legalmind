@@ -22,7 +22,7 @@ We welcome any and all contributions! Here are some ways you can get started:
 5. Keep the dataset in data folder as data.csv with single column header as text.
 6. Run the file with specific configuration:
     ```
-    python llama2-finetune.py --model_name meta-llama/Llama-2-7b-hf \
+    python fine-tune.py --model_name meta-llama/Llama-2-7b-hf \
      --load_in_4bit \
      --use_peft \
      --batch_size 4 \
